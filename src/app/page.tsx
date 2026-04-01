@@ -8,7 +8,7 @@ import TextType from '@/components/TextType'
 type QuestionSection = 'listening' | 'reading' | 'writing' | 'speaking'
 type QuestionType =
   | 'mcq' | 'tap_wrong_word' | 'fill_blank'
-  | 'sentence_build' | 'rewrite' | 'open_text' | 'speech' | 'conversational_speech'
+  | 'sentence_build' | 'rewrite' | 'open_text' | 'speech' | 'conversational_speech' | 'conversational_writing'
 
 interface Question {
   id: number
@@ -22,6 +22,9 @@ interface Question {
   hint?: string
   sentence?: string
   forbidden_words?: string[]
+  image?: string
+  image_description?: string
+  initial_message?: string
 }
 
 interface AnswerResult {
@@ -33,6 +36,10 @@ interface AnswerResult {
   spoken?: string
   avg_accuracy?: number
   avg_fluency?: number
+  avg_completeness?: number
+  avg_pronunciation?: number
+  language_score?: number
+  relevance_score?: number
 }
 
 interface AnswerResponse {
@@ -41,6 +48,8 @@ interface AnswerResponse {
   next_question?: Question
   progress?: { current: number; total: number }
   final_score?: number
+  is_turn_based?: boolean
+  chat_response?: string
 }
 
 interface SectionScoreMap {
@@ -127,6 +136,11 @@ export default function Home() {
   const [userAnswer, setUserAnswer] = useState<string | null>(null)
   const [currentConversationText, setCurrentConversationText] = useState<string | null>(null)
   const [speakingResult, setSpeakingResult] = useState<AnswerResult | null>(null)
+  const [writingResult, setWritingResult] = useState<AnswerResult | null>(null)
+
+  // Conversation history for conversational_writing
+  const [conversationMessages, setConversationMessages] = useState<Array<{ role: 'user' | 'ai', text: string }>>([])
+
   const nextQuestionRef = useRef<Question | null>(null)
 
   // ── Browser TTS ────────────────────────────────────────────────────────────
@@ -181,6 +195,7 @@ export default function Home() {
       setPhase('question')
       setUserAnswer(null)
       setCurrentConversationText(null)
+      setConversationMessages([])
       setShowOptions(false)
     } catch (err: any) {
       setFormError(`Connection Error: ${err.message}. Check if backend is running at ${BASE_URL}`)
@@ -203,14 +218,36 @@ export default function Home() {
       if (question?.type === 'conversational_speech') {
         setSpeakingResult(raw.result)
       }
+      if (question?.type === 'conversational_writing') {
+        setWritingResult(raw.result)
+      }
       setIsDone(true)
     }
   }
 
   const submitText = async (answer: string) => {
     setLoading(true)
-    setUserAnswer(answer)
-    try { processResponse(await apiAnswerText(sessionId, answer)) }
+
+    // For conversational_writing, add to conversation UI immediately
+    if (question?.type === 'conversational_writing') {
+      setConversationMessages(prev => [...prev, { role: 'user', text: answer }])
+    } else {
+      setUserAnswer(answer)
+    }
+
+    try {
+      const resp = await apiAnswerText(sessionId, answer)
+
+      // Handle conversational writing turn-based flow
+      if (resp.is_turn_based && resp.chat_response) {
+        setConversationMessages(prev => [...prev, { role: 'ai', text: resp.chat_response }])
+        setLocalResult(null) // Don't show final result yet
+        setShowOptions(false) // Reset to allow typing animation
+        setCurrentConversationText(resp.chat_response)
+      } else {
+        processResponse(resp)
+      }
+    }
     catch (err: any) { alert(`Error: ${err.message}`) }
     finally { setLoading(false) }
   }
@@ -256,6 +293,7 @@ export default function Home() {
       setShowOptions(false)
       setUserAnswer(null)
       setCurrentConversationText(null)
+      setConversationMessages([])
       nextQuestionRef.current = null
     }
   }
@@ -265,7 +303,7 @@ export default function Home() {
     setName(''); setGrade('7'); setPhase('welcome')
     setQuestion(null); setLocalResult(null)
     setSectionScores({ ...EMPTY_SCORES }); setFinalScore(0); setIsDone(false)
-    setSpeakingResult(null)
+    setSpeakingResult(null); setConversationMessages([])
   }
 
   // ── Progress pct ───────────────────────────────────────────────────────────
@@ -319,6 +357,8 @@ export default function Home() {
         {/* ── QUESTION ──────────────────────────────────────────────────────── */}
         {phase === 'question' && question && (() => {
           const meta = SECTION_META[question.section] || { label: question.section, icon: '❓', badgeClass: '' }
+          const isConversationalWriting = question.type === 'conversational_writing'
+
           return (
             <div className="chat-container">
               {/* Progress bar */}
@@ -332,7 +372,24 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Question Message */}
+              {/* Image for conversational writing - show at top */}
+              {isConversationalWriting && question.image && (
+                <div style={{ textAlign: 'center', marginBottom: 20 }}>
+                  <img
+                    src={`/${question.image}`}
+                    alt="Task Sketch"
+                    style={{
+                      width: '100%',
+                      maxWidth: '400px',
+                      borderRadius: '16px',
+                      border: '6px solid var(--border)',
+                      boxShadow: '0 8px 16px rgba(0,0,0,0.1)'
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* Initial Question Message (or current AI message for conversational) */}
               <div className="chat-row chat-row-left">
                 <div className="mascot-sam-mini">
                   {question.section === 'listening' ? '👦' :
@@ -363,6 +420,12 @@ export default function Home() {
                   <div className="question-text">
                     <TextType
                       text={(() => {
+                        // For conversational writing, show initial or current AI message
+                        if (isConversationalWriting) {
+                          // The main bubble ALWAYS shows the initial setup question
+                          return question.initial_message || question.question
+                        }
+
                         if (currentConversationText) {
                           return currentConversationText;
                         }
@@ -370,7 +433,6 @@ export default function Home() {
                           return question.question.split(':')[0].trim();
                         }
                         if (question.type === 'fill_blank') {
-                          // Only show the instruction part
                           return question.question.split(':')[0].trim();
                         }
                         if (question.sentence && question.question && question.sentence !== question.question) {
@@ -378,7 +440,7 @@ export default function Home() {
                         }
                         return question.question || question.sentence || "";
                       })()}
-                      key={currentConversationText || question.id}
+                      key={`${question.id}${isConversationalWriting ? '-static' : ''}`}
                       shouldStart={question.section !== 'listening' || isAudioPlaying}
                       typingSpeed={30}
                       loop={false}
@@ -386,36 +448,75 @@ export default function Home() {
                     />
                   </div>
 
-                  {question.hint && <p className="question-hint" style={{ marginTop: '8px', marginBottom: 0 }}>💡 {question.hint}</p>}
+                  {question.hint && conversationMessages.length === 0 && <p className="question-hint" style={{ marginTop: '8px', marginBottom: 0 }}>💡 {question.hint}</p>}
                 </div>
               </div>
 
-              {/* User Answer Area (Right) */}
-              <div className="chat-row chat-row-right">
-                <div className="chat-options-container" style={{ alignItems: 'flex-end', maxWidth: '100%' }}>
-                  {!localResult && !loading && showOptions && (
-                    <div style={{ width: '100%', display: 'flex', justifyContent: 'flex-end' }}>
-                      <div style={{ maxWidth: '400px', width: '100%' }}>
-                        <QuestionInput
-                          question={question}
-                          onSubmitText={submitText}
-                          onSubmitList={submitList}
-                          onSubmitSpeech={submitSpeech}
+              {/* Conversation messages for conversational_writing */}
+              {isConversationalWriting && conversationMessages.map((msg, idx) => (
+                msg.role === 'user' ? (
+                  <div key={`user-${idx}`} className="chat-row chat-row-right">
+                    <div className="chat-bubble chat-bubble-user" style={{ animation: 'slideRight 0.3s ease both' }}>
+                      <div className="chat-bubble-user-label">Me</div>
+                      <div>{msg.text}</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div key={`ai-${idx}`} className="chat-row chat-row-left">
+                    <div className="mascot-sam-mini">✍️</div>
+                    <div className="chat-bubble chat-bubble-sam" style={{ animation: 'slideLeft 0.3s ease both' }}>
+                      <div className="question-text">
+                        <TextType
+                          text={msg.text}
+                          typingSpeed={30}
+                          onSentenceComplete={() => setShowOptions(true)}
                         />
                       </div>
                     </div>
-                  )}
+                  </div>
+                )
+              ))}
 
-                  {userAnswer && (
-                    <div className="chat-bubble chat-bubble-user" style={{ animation: 'slideRight 0.3s ease both' }}>
-                      <div className="chat-bubble-user-label">My Answer</div>
-                      <div>
-                        {userAnswer}
+              {/* User Answer Area (Right) - for non-conversational or ongoing conversation */}
+              {!isConversationalWriting && (
+                <div className="chat-row chat-row-right">
+                  <div className="chat-options-container" style={{ alignItems: 'flex-end', maxWidth: '100%' }}>
+                    {!localResult && !loading && showOptions && (
+                      <div style={{ width: '100%', display: 'flex', justifyContent: 'flex-end' }}>
+                        <div style={{ maxWidth: '400px', width: '100%' }}>
+                          <QuestionInput
+                            question={question}
+                            onSubmitText={submitText}
+                            onSubmitList={submitList}
+                            onSubmitSpeech={submitSpeech}
+                          />
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
+
+                    {userAnswer && (
+                      <div className="chat-bubble chat-bubble-user" style={{ animation: 'slideRight 0.3s ease both' }}>
+                        <div className="chat-bubble-user-label">My Answer</div>
+                        <div>{userAnswer}</div>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
+              )}
+
+              {/* Input for conversational writing */}
+              {isConversationalWriting && !localResult && showOptions && (
+                <div className="chat-row chat-row-right">
+                  <div style={{ width: '100%', maxWidth: '500px', marginLeft: 'auto' }}>
+                    <QuestionInput
+                      question={question}
+                      onSubmitText={submitText}
+                      onSubmitList={submitList}
+                      onSubmitSpeech={submitSpeech}
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* Sam's Feedback Bubble */}
               {loading && (
@@ -427,7 +528,7 @@ export default function Home() {
                 </div>
               )}
 
-              {localResult && (
+              {localResult && !loading && (
                 <div className="chat-row chat-row-left">
                   <div className="mascot-sam-mini">👦</div>
                   <div className="chat-bubble chat-bubble-sam chat-bubble-feedback">
@@ -459,6 +560,7 @@ export default function Home() {
             finalScore={finalScore}
             sectionScores={sectionScores}
             speakingResult={speakingResult}
+            writingResult={writingResult}
             onRestart={restart}
           />
         )}
@@ -468,7 +570,7 @@ export default function Home() {
   )
 }
 
-// ─── Conversational Welcome ───────────────────────────────────────────────────
+// ─── Conversational Welcome (keeping existing implementation) ─────────────────
 
 function ConversationalWelcome({
   name, setName,
@@ -499,7 +601,6 @@ function ConversationalWelcome({
     if (step < 3) setStep(prev => prev + 1)
   }
 
-  // Auto-speak once per step
   useEffect(() => {
     if (spokenRef.current === step) return
     let text = ""
@@ -591,7 +692,7 @@ function ConversationalWelcome({
   )
 }
 
-// ─── Question Input Router ────────────────────────────────────────────────────
+// ─── Question Input Router (keeping existing + conversational_writing) ────────
 
 interface InputProps {
   question: Question
@@ -608,13 +709,14 @@ function QuestionInput({ question, onSubmitText, onSubmitList, onSubmitSpeech }:
     case 'sentence_build': return <SentenceBuildInput q={question} onSubmit={onSubmitText} />
     case 'rewrite': return <OpenTextInput q={question} onSubmit={onSubmitText} placeholder="Rewrite the sentence correctly…" />
     case 'open_text': return <OpenTextInput q={question} onSubmit={onSubmitText} />
+    case 'conversational_writing': return <OpenTextInput q={question} onSubmit={onSubmitText} placeholder="Type your response here..." />
     case 'speech':
     case 'conversational_speech': return <SpeechInput q={question} onSubmit={onSubmitSpeech} />
     default: return <p style={{ color: 'var(--text-muted)' }}>Unknown question type.</p>
   }
 }
 
-// ─── MCQ ──────────────────────────────────────────────────────────────────────
+// ─── (Keeping all existing input components: MCQ, TapWord, FillBlank, SentenceBuild, OpenText, Speech) ───
 
 function MCQInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => Promise<void> }) {
   const [selected, setSelected] = useState<string | null>(null)
@@ -640,8 +742,6 @@ function MCQInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => Promi
     </div>
   )
 }
-
-// ─── Tap Wrong Word ───────────────────────────────────────────────────────────
 
 function TapWordInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => Promise<void> }) {
   const [selected, setSelected] = useState<string | null>(null)
@@ -675,19 +775,13 @@ function TapWordInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => P
   )
 }
 
-// ─── Fill Blank ───────────────────────────────────────────────────────────────
-
 function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) => Promise<void> }) {
   const blanks = q.blanks ?? 1
   const [slots, setSlots] = useState<(string | null)[]>(Array(blanks).fill(null))
   const [used, setUsed] = useState<string[]>([])
   const [submitted, setSubmitted] = useState(false)
 
-  // Try to find the sentence part of the question
   const sentence = q.question.includes('"') ? q.question.split('"')[1] : (q.sentence || q.question);
-
-  // Split the sentence by underscores to insert our interactive slots
-  // We handle ___ , __ etc.
   const parts = sentence.split(/_+/)
 
   const selectOpt = (opt: string) => {
@@ -725,7 +819,6 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
 
   return (
     <div className="fill-interactive-container">
-      {/* The Sentence with Blanks */}
       <div className="fill-sentence-area" style={{ marginBottom: 24, fontSize: '18px', fontWeight: 600, lineHeight: 1.8 }}>
         {parts.map((p, i) => (
           <span key={i}>
@@ -744,7 +837,6 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
         ))}
       </div>
 
-      {/* The Options */}
       <div className="fill-options" style={{ justifyContent: 'center', marginBottom: 24 }}>
         {q.options?.map((opt, i) => (
           <button
@@ -771,8 +863,6 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
     </div>
   )
 }
-
-// ─── Sentence Build ───────────────────────────────────────────────────────────
 
 function SentenceBuildInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => Promise<void> }) {
   const [bank, setBank] = useState<{ word: string; id: string }[]>(() =>
@@ -842,8 +932,6 @@ function SentenceBuildInput({ q, onSubmit }: { q: Question; onSubmit: (a: string
   )
 }
 
-// ─── Open Text / Rewrite ──────────────────────────────────────────────────────
-
 function OpenTextInput({
   q, onSubmit, placeholder,
 }: { q: Question; onSubmit: (a: string) => Promise<void>; placeholder?: string }) {
@@ -854,32 +942,56 @@ function OpenTextInput({
     if (!text.trim() || submitted) return
     setSubmitted(true)
     onSubmit(text.trim())
+    // For conversational types, reset for next turn
+    if (q.type === 'conversational_writing') {
+      setText('')
+      setSubmitted(false)
+    }
   }
 
   return (
     <div>
+      {q.image && q.type !== 'conversational_writing' && (
+        <div style={{ textAlign: 'center', marginBottom: 20 }}>
+          <img
+            src={`/${q.image}`}
+            alt="Task Sketch"
+            style={{
+              width: '100%',
+              maxWidth: '400px',
+              borderRadius: '16px',
+              border: '6px solid var(--border)',
+              boxShadow: '0 8px 16px rgba(0,0,0,0.1)'
+            }}
+          />
+        </div>
+      )}
       <textarea
         id={`ot-${q.id}`}
         className="text-area"
         placeholder={placeholder ?? 'Write your answer here…'}
         value={text}
         onChange={e => setText(e.target.value)}
-        disabled={submitted}
-        rows={4}
+        disabled={submitted && q.type !== 'conversational_writing'}
+        rows={q.type === 'conversational_writing' ? 2 : 4}
+        onKeyDown={e => {
+          if (e.key === 'Enter' && !e.shiftKey && q.type === 'conversational_writing') {
+            e.preventDefault()
+            doSubmit()
+          }
+        }}
       />
       <button
         id={`ot-submit-${q.id}`}
         className="btn-primary"
         onClick={doSubmit}
-        disabled={!text.trim() || submitted}
+        disabled={!text.trim() || (submitted && q.type !== 'conversational_writing')}
       >
-        Submit
+        {q.type === 'conversational_writing' ? 'Send →' : 'Submit'}
       </button>
     </div>
   )
 }
-
-// ─── Speech ───────────────────────────────────────────────────────────────────
 
 function SpeechInput({ q, onSubmit }: { q: Question; onSubmit: (b: Blob) => Promise<void> }) {
   const [recording, setRecording] = useState(false)
@@ -962,7 +1074,7 @@ function SpeechInput({ q, onSubmit }: { q: Question; onSubmit: (b: Blob) => Prom
   )
 }
 
-// ─── Results Screen ───────────────────────────────────────────────────────────
+// ─── Results Screen (keeping existing) ────────────────────────────────────────
 
 function avg(arr: number[]) {
   return arr.length ? Math.round(arr.reduce((s, n) => s + n, 0) / arr.length) : 0
@@ -1019,17 +1131,16 @@ interface ResultsProps {
   finalScore: number
   sectionScores: SectionScoreMap
   speakingResult: AnswerResult | null
+  writingResult: AnswerResult | null
   onRestart: () => void
 }
 
-function ResultsScreen({ name, grade, finalScore, sectionScores, speakingResult, onRestart }: ResultsProps) {
+function ResultsScreen({ name, grade, finalScore, sectionScores, speakingResult, writingResult, onRestart }: ResultsProps) {
   const rounded = Math.round(finalScore)
 
-  // Check if we are exclusively showing Speaking
-  const isSpeakingOnly = sectionScores.speaking.length > 0 &&
-    sectionScores.listening.length === 0 &&
-    sectionScores.reading.length === 0 &&
-    sectionScores.writing.length === 0;
+  const attempted = SECTION_LIST.filter(s => sectionScores[s.key].length > 0);
+  const isSingleSection = attempted.length === 1;
+  const singleSection = isSingleSection ? attempted[0] : null;
 
   return (
     <div>
@@ -1038,41 +1149,75 @@ function ResultsScreen({ name, grade, finalScore, sectionScores, speakingResult,
         <ScoreRing score={rounded} />
         <p className="results-name">{name}</p>
         <p className="results-class">Class {grade} · Quto Quest Adventure</p>
-        <p style={{ marginTop: 12, fontSize: 18, fontWeight: 700, color: 'var(--accent-green)' }}>
-          {gradeLabel(rounded)}
+        <p style={{ marginTop: 12, fontSize: 18, fontWeight: 700, color: 'var(--accent-green)', padding: '0 20px', lineHeight: 1.5 }}>
+          {isSingleSection && (singleSection?.key === 'speaking' ? speakingResult?.feedback : writingResult?.feedback)
+            ? `Quto's Report: "${singleSection?.key === 'speaking' ? speakingResult?.feedback : writingResult?.feedback}"`
+            : gradeLabel(rounded)}
         </p>
       </div>
 
       <div className="divider" />
 
-      {isSpeakingOnly && speakingResult ? (
-        <div className="speaking-detailed-result" style={{ animation: 'slideUp 0.6s ease both' }}>
+      {/* If it's a single section (like Speaking only or Writing only) */}
+      {isSingleSection && singleSection ? (
+        <div className={`${singleSection.key}-detailed-result`} style={{ animation: 'slideUp 0.6s ease both' }}>
           <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: 20 }}>
-            Speaking Performance Metrics
+            {singleSection.label} Performance
           </p>
 
-          <div className="metrics-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: 24 }}>
-            <div className="metric-card" style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: '16px', padding: '20px', textAlign: 'center' }}>
-              <div style={{ fontSize: '24px', marginBottom: '8px' }}>🎯</div>
-              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Accuracy</div>
-              <div style={{ fontSize: '28px', fontWeight: 800, color: 'var(--accent-blue)' }}>{speakingResult.avg_accuracy}%</div>
+          {/* Detailed metrics box (Specific to Speaking) */}
+          {singleSection.key === 'speaking' && speakingResult && (
+            <div className="metrics-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: 24 }}>
+              <div className="metric-card">
+                <div style={{ fontSize: '20px', marginBottom: '4px' }}>🎯</div>
+                <div className="metric-label">Accuracy</div>
+                <div className="metric-value blue">{speakingResult.avg_accuracy}%</div>
+              </div>
+              <div className="metric-card">
+                <div style={{ fontSize: '20px', marginBottom: '4px' }}>🌊</div>
+                <div className="metric-label">Fluency</div>
+                <div className="metric-value purple">{speakingResult.avg_fluency}%</div>
+              </div>
+              <div className="metric-card">
+                <div style={{ fontSize: '20px', marginBottom: '4px' }}>✅</div>
+                <div className="metric-label">Completeness</div>
+                <div className="metric-value green">{speakingResult.avg_completeness}%</div>
+              </div>
+              <div className="metric-card">
+                <div style={{ fontSize: '20px', marginBottom: '4px' }}>🗣️</div>
+                <div className="metric-label">Pronunciation</div>
+                <div className="metric-value amber">{speakingResult.avg_pronunciation}%</div>
+              </div>
             </div>
-            <div className="metric-card" style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: '16px', padding: '20px', textAlign: 'center' }}>
-              <div style={{ fontSize: '24px', marginBottom: '8px' }}>🌊</div>
-              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Fluency</div>
-              <div style={{ fontSize: '28px', fontWeight: 800, color: 'var(--accent-purple)' }}>{speakingResult.avg_fluency}%</div>
-            </div>
-          </div>
+          )}
 
-          <div className="ai-feedback-box" style={{ background: 'linear-gradient(135deg, rgba(147, 51, 234, 0.05), rgba(79, 70, 229, 0.05))', border: '1px solid rgba(147, 51, 234, 0.2)', borderRadius: '20px', padding: '24px', marginBottom: 32 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
-              <span style={{ fontSize: '20px' }}>🤖</span>
-              <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0, color: 'var(--accent-purple)' }}>Sam&apos;s Improvement Guide</h3>
+          {/* Simple score box (Only show if NOT single section to avoid duplication with the big ring) */}
+          {!isSingleSection && (
+            <div className="section-scores" style={{ marginBottom: 24 }}>
+              <div className="section-score-card" style={{ width: '100%', maxWidth: 'none' }}>
+                <div className="section-score-icon">{singleSection.icon}</div>
+                <div className="section-score-name">{singleSection.label} Score</div>
+                <div className={`section-score-value ${singleSection.cls}`}>
+                  {avg(sectionScores[singleSection.key])}
+                </div>
+              </div>
             </div>
-            <p style={{ fontSize: '15px', color: 'var(--text-main)', lineHeight: '1.6', margin: 0, fontStyle: 'italic' }}>
-              &quot;{speakingResult.feedback}&quot;
-            </p>
-          </div>
+          )}
+
+          {/* AI Feedback (if available) */}
+          {(singleSection.key === 'speaking' ? speakingResult?.feedback : writingResult?.feedback) && (
+            <div className="ai-feedback-box">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+                <span style={{ fontSize: '20px' }}>{singleSection.key === 'speaking' ? '🤖' : '🪶'}</span>
+                <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0, color: 'var(--accent-purple)' }}>
+                  {singleSection.key === 'speaking' ? "Sam's Improvement Guide" : "Quto's Writing Tips"}
+                </h3>
+              </div>
+              <p style={{ fontSize: '15px', color: 'var(--text-main)', lineHeight: '1.6', margin: 0, fontStyle: 'italic' }}>
+                &quot;{singleSection.key === 'speaking' ? speakingResult?.feedback : writingResult?.feedback}&quot;
+              </p>
+            </div>
+          )}
         </div>
       ) : (
         <>
@@ -1091,6 +1236,14 @@ function ResultsScreen({ name, grade, finalScore, sectionScores, speakingResult,
               </div>
             ))}
           </div>
+
+          {/* Show combined feedback if multi-section has them */}
+          {writingResult?.feedback && (
+            <div className="ai-feedback-box" style={{ marginTop: 24 }}>
+              <p style={{ fontSize: '13px', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 12 }}>Writing Insight</p>
+              <p style={{ fontSize: '15px', fontStyle: 'italic' }}>&quot;{writingResult.feedback}&quot;</p>
+            </div>
+          )}
         </>
       )}
 
