@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import TextType from '@/components/TextType'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -8,7 +8,7 @@ import TextType from '@/components/TextType'
 type QuestionSection = 'listening' | 'reading' | 'writing' | 'speaking'
 type QuestionType =
   | 'mcq' | 'tap_wrong_word' | 'fill_blank'
-  | 'sentence_build' | 'rewrite' | 'open_text' | 'speech'
+  | 'sentence_build' | 'rewrite' | 'open_text' | 'speech' | 'conversational_speech'
 
 interface Question {
   id: number
@@ -31,6 +31,8 @@ interface AnswerResult {
   correct_count?: number
   total_blanks?: number
   spoken?: string
+  avg_accuracy?: number
+  avg_fluency?: number
 }
 
 interface AnswerResponse {
@@ -52,9 +54,11 @@ interface SectionScoreMap {
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8000'
 
-async function apiStart(section?: string): Promise<{ session_id: string; question: Question; total: number }> {
+async function apiStart(name: string, section?: string): Promise<{ session_id: string; question: Question; total: number }> {
   const url = section ? `${BASE_URL}/start?section=${section}` : `${BASE_URL}/start`
-  const res = await fetch(url, { method: 'POST' })
+  const form = new FormData()
+  form.append('name', name)
+  const res = await fetch(url, { method: 'POST', body: form })
   if (!res.ok) throw new Error('Failed to start session')
   return res.json()
 }
@@ -121,25 +125,43 @@ export default function Home() {
   const [isAudioPlaying, setIsAudioPlaying] = useState(false)
   const [showOptions, setShowOptions] = useState(false)
   const [userAnswer, setUserAnswer] = useState<string | null>(null)
+  const [currentConversationText, setCurrentConversationText] = useState<string | null>(null)
+  const [speakingResult, setSpeakingResult] = useState<AnswerResult | null>(null)
   const nextQuestionRef = useRef<Question | null>(null)
 
   // ── Browser TTS ────────────────────────────────────────────────────────────
-  const handleSpeak = (text: string) => {
+  const handleSpeak = useCallback((text: string) => {
     if (typeof window === 'undefined') return
-    window.speechSynthesis.cancel() // Stop any current speech
 
-    // Clean text: remove underscores so they aren't pronounced
-    const cleanText = text.replace(/_+/g, ' ')
+    const speak = () => {
+      window.speechSynthesis.cancel()
+      const cleanText = text.replace(/_+/g, ' ')
+      const utter = new SpeechSynthesisUtterance(cleanText)
 
-    const utter = new SpeechSynthesisUtterance(cleanText)
-    utter.rate = 0.9 // Slightly slower for clarity
-    utter.pitch = 1
+      const voices = window.speechSynthesis.getVoices()
+      // Prioritize "sweet" or "friendly" sounding voices for kids
+      const sweetVoice = voices.find(v => v.name.includes('Google US English')) ||
+        voices.find(v => v.name.includes('Natural')) ||
+        voices.find(v => v.name.includes('Zira')) ||
+        voices.find(v => v.lang === 'en-US' && v.name.includes('Female'))
 
-    utter.onstart = () => setIsAudioPlaying(true)
-    utter.onend = () => setIsAudioPlaying(false)
+      if (sweetVoice) utter.voice = sweetVoice
 
-    window.speechSynthesis.speak(utter)
-  }
+      utter.rate = 0.95 // Slightly slower for clarity
+      utter.pitch = 1.3 // Higher pitch for a "sweet/friendly robot" vibe
+      utter.volume = 1
+
+      utter.onstart = () => setIsAudioPlaying(true)
+      utter.onend = () => setIsAudioPlaying(false)
+      window.speechSynthesis.speak(utter)
+    }
+
+    if (window.speechSynthesis.getVoices().length === 0) {
+      window.speechSynthesis.onvoiceschanged = speak
+    } else {
+      speak()
+    }
+  }, [])
 
   // ── Start ──────────────────────────────────────────────────────────────────
   const startQuiz = async (selectedSection?: string) => {
@@ -147,7 +169,7 @@ export default function Home() {
     setFormError('')
     setPhase('loading')
     try {
-      const resp = await apiStart(selectedSection)
+      const resp = await apiStart(name, selectedSection)
       setSessionId(resp.session_id)
       setQuestion(resp.question)
       setTotal(resp.total)
@@ -158,6 +180,7 @@ export default function Home() {
       nextQuestionRef.current = null
       setPhase('question')
       setUserAnswer(null)
+      setCurrentConversationText(null)
       setShowOptions(false)
     } catch (err: any) {
       setFormError(`Connection Error: ${err.message}. Check if backend is running at ${BASE_URL}`)
@@ -177,6 +200,9 @@ export default function Home() {
     }
     if (raw.done) {
       setFinalScore(raw.final_score ?? raw.result.score)
+      if (question?.type === 'conversational_speech') {
+        setSpeakingResult(raw.result)
+      }
       setIsDone(true)
     }
   }
@@ -201,10 +227,19 @@ export default function Home() {
   const submitSpeech = async (blob: Blob) => {
     setLoading(true)
     setUserAnswer('🎤 Recording...')
-    try { 
-      const resp = await apiAnswerSpeech(sessionId, blob)
-      processResponse(resp)
-      if (resp.result.spoken) setUserAnswer(resp.result.spoken)
+    try {
+      const resp = await apiAnswerSpeech(sessionId, blob) as any
+      if (resp.is_turn_based) {
+        // It's a mid-conversation turn
+        setLocalResult(null)
+        setCurrentConversationText(resp.chat_response)
+        setUserAnswer(resp.result.spoken)
+        // Reset showOptions so the typing can finish before showing record btn again
+        setShowOptions(false)
+      } else {
+        processResponse(resp)
+        if (resp.result.spoken) setUserAnswer(resp.result.spoken)
+      }
     }
     catch (err: any) { alert(`Error: ${err.message}`) }
     finally { setLoading(false) }
@@ -220,6 +255,7 @@ export default function Home() {
       setLocalResult(null)
       setShowOptions(false)
       setUserAnswer(null)
+      setCurrentConversationText(null)
       nextQuestionRef.current = null
     }
   }
@@ -229,19 +265,34 @@ export default function Home() {
     setName(''); setGrade('7'); setPhase('welcome')
     setQuestion(null); setLocalResult(null)
     setSectionScores({ ...EMPTY_SCORES }); setFinalScore(0); setIsDone(false)
+    setSpeakingResult(null)
   }
 
   // ── Progress pct ───────────────────────────────────────────────────────────
-  const progress = question ? (questionIndex / total) * 100 : 0
+  const progress = (question && total > 0) ? (questionIndex / total) * 100 : 0
 
   return (
     <main className="page-wrapper">
       <div className="card">
 
         {/* Brand */}
-        <div className="brand-logo">
-          <div className="brand-icon">🦄</div>
-          <span className="brand-name">Sparky Quest</span>
+        <div className="brand-logo" style={{ marginBottom: '48px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px' }}>
+          <div style={{
+            background: 'var(--grad-main)',
+            color: '#fff',
+            borderRadius: '12px',
+            width: '44px',
+            height: '44px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '24px',
+            fontWeight: 900,
+            boxShadow: '0 4px 12px rgba(147, 51, 234, 0.3)'
+          }}>
+            Q
+          </div>
+          <span className="brand-name" style={{ color: 'var(--accent-purple)', fontSize: '32px', fontWeight: 900, letterSpacing: '-1px' }}>Quto Quest</span>
         </div>
 
         {/* ── WELCOME ───────────────────────────────────────────────────────── */}
@@ -252,6 +303,7 @@ export default function Home() {
             grade={grade}
             setGrade={setGrade}
             onStart={startQuiz}
+            onSpeak={handleSpeak}
             error={formError}
           />
         )}
@@ -266,7 +318,7 @@ export default function Home() {
 
         {/* ── QUESTION ──────────────────────────────────────────────────────── */}
         {phase === 'question' && question && (() => {
-          const meta = SECTION_META[question.section]
+          const meta = SECTION_META[question.section] || { label: question.section, icon: '❓', badgeClass: '' }
           return (
             <div className="chat-container">
               {/* Progress bar */}
@@ -283,9 +335,9 @@ export default function Home() {
               {/* Question Message */}
               <div className="chat-row chat-row-left">
                 <div className="mascot-sam-mini">
-                  {question.section === 'listening' ? '👦' : 
-                   question.section === 'reading' ? '📖' :
-                   question.section === 'writing' ? '✍️' : '🎤'}
+                  {question.section === 'listening' ? '👦' :
+                    question.section === 'reading' ? '📖' :
+                      question.section === 'writing' ? '✍️' : '🎤'}
                 </div>
                 <div className="chat-bubble chat-bubble-sam">
                   <span className={`section-badge ${meta.badgeClass}`} style={{ transform: 'scale(0.8)', transformOrigin: 'left', marginBottom: '8px' }}>
@@ -300,7 +352,7 @@ export default function Home() {
                         <button
                           className="btn-primary"
                           style={{ width: 'auto', padding: '6px 12px', margin: 0, fontSize: '11px', boxShadow: '0 3px 0px var(--accent-green-dark)' }}
-                          onClick={() => handleSpeak(`Sam says, ${question.audio_script!}`)}
+                          onClick={() => handleSpeak(`Sam says, ${currentConversationText || question.audio_script!}`)}
                         >
                           ▶️ PLAY
                         </button>
@@ -311,6 +363,9 @@ export default function Home() {
                   <div className="question-text">
                     <TextType
                       text={(() => {
+                        if (currentConversationText) {
+                          return currentConversationText;
+                        }
                         if (question.type === 'tap_wrong_word' || question.type === 'sentence_build') {
                           return question.question.split(':')[0].trim();
                         }
@@ -323,6 +378,7 @@ export default function Home() {
                         }
                         return question.question || question.sentence || "";
                       })()}
+                      key={currentConversationText || question.id}
                       shouldStart={question.section !== 'listening' || isAudioPlaying}
                       typingSpeed={30}
                       loop={false}
@@ -402,6 +458,7 @@ export default function Home() {
             grade={grade}
             finalScore={finalScore}
             sectionScores={sectionScores}
+            speakingResult={speakingResult}
             onRestart={restart}
           />
         )}
@@ -417,14 +474,17 @@ function ConversationalWelcome({
   name, setName,
   grade, setGrade,
   onStart,
+  onSpeak,
   error
 }: {
   name: string; setName: (n: string) => void;
   grade: string; setGrade: (g: string) => void;
   onStart: (section?: string) => void;
+  onSpeak: (text: string) => void;
   error?: string;
 }) {
   const [step, setStep] = useState(1)
+  const spokenRef = useRef(0)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const SECTIONS = [
@@ -439,13 +499,29 @@ function ConversationalWelcome({
     if (step < 3) setStep(prev => prev + 1)
   }
 
+  // Auto-speak once per step
+  useEffect(() => {
+    if (spokenRef.current === step) return
+    let text = ""
+    if (step === 1) text = "Hi! I'm Quto! What's your name?"
+    if (step === 2) text = `Nice to meet you, ${name}! What class are you in?`
+    if (step === 3) text = "Great! What do you want to practice today?"
+
+    if (text) {
+      onSpeak(text)
+      spokenRef.current = step
+    }
+  }, [step, onSpeak, name])
+
   return (
     <div className="conversational-container">
-      <div className="mascot-wrapper">🦄</div>
+      <div className="mascot-wrapper">
+        <img src="/freepik__background__42262 2.webp" alt="Mascot" style={{ width: '80%', height: '80%', objectFit: 'contain' }} />
+      </div>
 
       <div className="speech-bubble">
         {step === 1 ? (
-          <>Hi! I&apos;m Sparky! <br /> What&apos;s your name?</>
+          <>Hi! I&apos;m Quto! <br /> What&apos;s your name?</>
         ) : step === 2 ? (
           <>Nice to meet you, {name}! <br /> What class are you in?</>
         ) : (
@@ -532,7 +608,8 @@ function QuestionInput({ question, onSubmitText, onSubmitList, onSubmitSpeech }:
     case 'sentence_build': return <SentenceBuildInput q={question} onSubmit={onSubmitText} />
     case 'rewrite': return <OpenTextInput q={question} onSubmit={onSubmitText} placeholder="Rewrite the sentence correctly…" />
     case 'open_text': return <OpenTextInput q={question} onSubmit={onSubmitText} />
-    case 'speech': return <SpeechInput q={question} onSubmit={onSubmitSpeech} />
+    case 'speech':
+    case 'conversational_speech': return <SpeechInput q={question} onSubmit={onSubmitSpeech} />
     default: return <p style={{ color: 'var(--text-muted)' }}>Unknown question type.</p>
   }
 }
@@ -608,7 +685,7 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
 
   // Try to find the sentence part of the question
   const sentence = q.question.includes('"') ? q.question.split('"')[1] : (q.sentence || q.question);
-  
+
   // Split the sentence by underscores to insert our interactive slots
   // We handle ___ , __ etc.
   const parts = sentence.split(/_+/)
@@ -654,7 +731,7 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
           <span key={i}>
             {p}
             {i < parts.length - 1 && (
-              <span 
+              <span
                 className={`blank-slot-inline ${slots[i] ? 'filled' : 'empty'}`}
                 onClick={() => slots[i] && clearSlot(i)}
                 style={{ cursor: slots[i] ? 'pointer' : 'default' }}
@@ -941,18 +1018,26 @@ interface ResultsProps {
   grade: string
   finalScore: number
   sectionScores: SectionScoreMap
+  speakingResult: AnswerResult | null
   onRestart: () => void
 }
 
-function ResultsScreen({ name, grade, finalScore, sectionScores, onRestart }: ResultsProps) {
+function ResultsScreen({ name, grade, finalScore, sectionScores, speakingResult, onRestart }: ResultsProps) {
   const rounded = Math.round(finalScore)
+
+  // Check if we are exclusively showing Speaking
+  const isSpeakingOnly = sectionScores.speaking.length > 0 &&
+    sectionScores.listening.length === 0 &&
+    sectionScores.reading.length === 0 &&
+    sectionScores.writing.length === 0;
+
   return (
     <div>
       <div className="results-hero">
         <div className="stars">✨✨✨</div>
         <ScoreRing score={rounded} />
         <p className="results-name">{name}</p>
-        <p className="results-class">Class {grade} · Sparky Quest Adventure</p>
+        <p className="results-class">Class {grade} · Quto Quest Adventure</p>
         <p style={{ marginTop: 12, fontSize: 18, fontWeight: 700, color: 'var(--accent-green)' }}>
           {gradeLabel(rounded)}
         </p>
@@ -960,21 +1045,54 @@ function ResultsScreen({ name, grade, finalScore, sectionScores, onRestart }: Re
 
       <div className="divider" />
 
-      <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: 12 }}>
-        Section Breakdown
-      </p>
+      {isSpeakingOnly && speakingResult ? (
+        <div className="speaking-detailed-result" style={{ animation: 'slideUp 0.6s ease both' }}>
+          <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: 20 }}>
+            Speaking Performance Metrics
+          </p>
 
-      <div className="section-scores">
-        {SECTION_LIST.map(s => (
-          <div key={s.key} className="section-score-card">
-            <div className="section-score-icon">{s.icon}</div>
-            <div className="section-score-name">{s.label}</div>
-            <div className={`section-score-value ${s.cls}`}>
-              {avg(sectionScores[s.key])}
+          <div className="metrics-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: 24 }}>
+            <div className="metric-card" style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: '16px', padding: '20px', textAlign: 'center' }}>
+              <div style={{ fontSize: '24px', marginBottom: '8px' }}>🎯</div>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Accuracy</div>
+              <div style={{ fontSize: '28px', fontWeight: 800, color: 'var(--accent-blue)' }}>{speakingResult.avg_accuracy}%</div>
+            </div>
+            <div className="metric-card" style={{ background: 'var(--card-bg)', border: '1px solid var(--border)', borderRadius: '16px', padding: '20px', textAlign: 'center' }}>
+              <div style={{ fontSize: '24px', marginBottom: '8px' }}>🌊</div>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Fluency</div>
+              <div style={{ fontSize: '28px', fontWeight: 800, color: 'var(--accent-purple)' }}>{speakingResult.avg_fluency}%</div>
             </div>
           </div>
-        ))}
-      </div>
+
+          <div className="ai-feedback-box" style={{ background: 'linear-gradient(135deg, rgba(147, 51, 234, 0.05), rgba(79, 70, 229, 0.05))', border: '1px solid rgba(147, 51, 234, 0.2)', borderRadius: '20px', padding: '24px', marginBottom: 32 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
+              <span style={{ fontSize: '20px' }}>🤖</span>
+              <h3 style={{ fontSize: '16px', fontWeight: 700, margin: 0, color: 'var(--accent-purple)' }}>Sam&apos;s Improvement Guide</h3>
+            </div>
+            <p style={{ fontSize: '15px', color: 'var(--text-main)', lineHeight: '1.6', margin: 0, fontStyle: 'italic' }}>
+              &quot;{speakingResult.feedback}&quot;
+            </p>
+          </div>
+        </div>
+      ) : (
+        <>
+          <p style={{ fontSize: 13, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', marginBottom: 12 }}>
+            Section Breakdown
+          </p>
+
+          <div className="section-scores">
+            {SECTION_LIST.map(s => (
+              <div key={s.key} className="section-score-card">
+                <div className="section-score-icon">{s.icon}</div>
+                <div className="section-score-name">{s.label}</div>
+                <div className={`section-score-value ${s.cls}`}>
+                  {avg(sectionScores[s.key])}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <div className="divider" />
 
