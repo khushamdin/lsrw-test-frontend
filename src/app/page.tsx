@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
+import TextType from '@/components/TextType'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -51,8 +52,9 @@ interface SectionScoreMap {
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8000'
 
-async function apiStart(): Promise<{ session_id: string; question: Question; total: number }> {
-  const res = await fetch(`${BASE_URL}/start`, { method: 'POST' })
+async function apiStart(section?: string): Promise<{ session_id: string; question: Question; total: number }> {
+  const url = section ? `${BASE_URL}/start?section=${section}` : `${BASE_URL}/start`
+  const res = await fetch(url, { method: 'POST' })
   if (!res.ok) throw new Error('Failed to start session')
   return res.json()
 }
@@ -87,10 +89,10 @@ async function apiAnswerSpeech(sessionId: string, blob: Blob): Promise<AnswerRes
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const SECTION_META: Record<string, { label: string; icon: string; badgeClass: string }> = {
-  listening: { label: 'Listening', icon: '🎧', badgeClass: 'badge-listening' },
-  reading:   { label: 'Reading',   icon: '📖', badgeClass: 'badge-reading'   },
-  writing:   { label: 'Writing',   icon: '✍️',  badgeClass: 'badge-writing'  },
-  speaking:  { label: 'Speaking',  icon: '🎤', badgeClass: 'badge-speaking'  },
+  listening: { label: 'Listening Quest', icon: '🎧', badgeClass: 'badge-listening' },
+  reading: { label: 'Reading Explorer', icon: '📖', badgeClass: 'badge-reading' },
+  writing: { label: 'Writing Master', icon: '✍️', badgeClass: 'badge-writing' },
+  speaking: { label: 'Speaking Hero', icon: '🎤', badgeClass: 'badge-speaking' },
 }
 
 const OPT_LABELS = ['A', 'B', 'C', 'D', 'E', 'F']
@@ -102,39 +104,50 @@ const EMPTY_SCORES: SectionScoreMap = { listening: [], reading: [], writing: [],
 type Phase = 'welcome' | 'loading' | 'question' | 'done'
 
 export default function Home() {
-  const [name, setName]         = useState('')
-  const [grade, setGrade]       = useState('7')
+  const [name, setName] = useState('')
+  const [grade, setGrade] = useState('7')
   const [formError, setFormError] = useState('')
 
-  const [phase, setPhase]               = useState<Phase>('welcome')
-  const [sessionId, setSessionId]       = useState('')
-  const [question, setQuestion]         = useState<Question | null>(null)
+  const [phase, setPhase] = useState<Phase>('welcome')
+  const [sessionId, setSessionId] = useState('')
+  const [question, setQuestion] = useState<Question | null>(null)
   const [questionIndex, setQuestionIndex] = useState(0)
-  const [total, setTotal]               = useState(0)
-  const [localResult, setLocalResult]   = useState<AnswerResult | null>(null)
-  const [loading, setLoading]           = useState(false)
+  const [total, setTotal] = useState(0)
+  const [localResult, setLocalResult] = useState<AnswerResult | null>(null)
+  const [loading, setLoading] = useState(false)
   const [sectionScores, setSectionScores] = useState<SectionScoreMap>({ ...EMPTY_SCORES })
-  const [finalScore, setFinalScore]     = useState(0)
-  const [isDone, setIsDone]             = useState(false)
+  const [finalScore, setFinalScore] = useState(0)
+  const [isDone, setIsDone] = useState(false)
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false)
+  const [showOptions, setShowOptions] = useState(false)
+  const [userAnswer, setUserAnswer] = useState<string | null>(null)
   const nextQuestionRef = useRef<Question | null>(null)
 
   // ── Browser TTS ────────────────────────────────────────────────────────────
   const handleSpeak = (text: string) => {
     if (typeof window === 'undefined') return
     window.speechSynthesis.cancel() // Stop any current speech
-    const utter = new SpeechSynthesisUtterance(text)
+
+    // Clean text: remove underscores so they aren't pronounced
+    const cleanText = text.replace(/_+/g, ' ')
+
+    const utter = new SpeechSynthesisUtterance(cleanText)
     utter.rate = 0.9 // Slightly slower for clarity
     utter.pitch = 1
+
+    utter.onstart = () => setIsAudioPlaying(true)
+    utter.onend = () => setIsAudioPlaying(false)
+
     window.speechSynthesis.speak(utter)
   }
 
   // ── Start ──────────────────────────────────────────────────────────────────
-  const startQuiz = async () => {
+  const startQuiz = async (selectedSection?: string) => {
     if (!name.trim()) { setFormError('Please enter your name.'); return }
     setFormError('')
     setPhase('loading')
     try {
-      const resp = await apiStart()
+      const resp = await apiStart(selectedSection)
       setSessionId(resp.session_id)
       setQuestion(resp.question)
       setTotal(resp.total)
@@ -144,6 +157,8 @@ export default function Home() {
       setIsDone(false)
       nextQuestionRef.current = null
       setPhase('question')
+      setUserAnswer(null)
+      setShowOptions(false)
     } catch (err: any) {
       setFormError(`Connection Error: ${err.message}. Check if backend is running at ${BASE_URL}`)
       setPhase('welcome')
@@ -168,6 +183,7 @@ export default function Home() {
 
   const submitText = async (answer: string) => {
     setLoading(true)
+    setUserAnswer(answer)
     try { processResponse(await apiAnswerText(sessionId, answer)) }
     catch (err: any) { alert(`Error: ${err.message}`) }
     finally { setLoading(false) }
@@ -175,6 +191,8 @@ export default function Home() {
 
   const submitList = async (answers: string[]) => {
     setLoading(true)
+    const combined = answers.join(', ')
+    setUserAnswer(combined)
     try { processResponse(await apiAnswerList(sessionId, answers)) }
     catch (err: any) { alert(`Error: ${err.message}`) }
     finally { setLoading(false) }
@@ -182,7 +200,12 @@ export default function Home() {
 
   const submitSpeech = async (blob: Blob) => {
     setLoading(true)
-    try { processResponse(await apiAnswerSpeech(sessionId, blob)) }
+    setUserAnswer('🎤 Recording...')
+    try { 
+      const resp = await apiAnswerSpeech(sessionId, blob)
+      processResponse(resp)
+      if (resp.result.spoken) setUserAnswer(resp.result.spoken)
+    }
     catch (err: any) { alert(`Error: ${err.message}`) }
     finally { setLoading(false) }
   }
@@ -195,6 +218,8 @@ export default function Home() {
       setQuestion(next)
       setQuestionIndex(prev => prev + 1)
       setLocalResult(null)
+      setShowOptions(false)
+      setUserAnswer(null)
       nextQuestionRef.current = null
     }
   }
@@ -215,56 +240,20 @@ export default function Home() {
 
         {/* Brand */}
         <div className="brand-logo">
-          <div className="brand-icon">🏝️</div>
-          <span className="brand-name">LSRW Quest</span>
+          <div className="brand-icon">🦄</div>
+          <span className="brand-name">Sparky Quest</span>
         </div>
 
         {/* ── WELCOME ───────────────────────────────────────────────────────── */}
         {phase === 'welcome' && (
-          <div>
-            <h1 className="welcome-title">Mystery Island Assessment</h1>
-            <p className="welcome-subtitle">
-              Test your Listening, Speaking, Reading &amp; Writing skills through an epic adventure!
-            </p>
-
-            <div className="form-group">
-              <label className="form-label" htmlFor="input-name">Your Name</label>
-              <input
-                id="input-name"
-                className="form-input"
-                type="text"
-                placeholder="e.g. Meera"
-                value={name}
-                onChange={e => setName(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && startQuiz()}
-                autoFocus
-              />
-            </div>
-
-            <div className="form-group">
-              <label className="form-label" htmlFor="select-class">Class</label>
-              <div className="select-wrapper">
-                <select
-                  id="select-class"
-                  className="form-select"
-                  value={grade}
-                  onChange={e => setGrade(e.target.value)}
-                >
-                  <option value="7">Class 7</option>
-                </select>
-              </div>
-            </div>
-
-            {formError && (
-              <div className="feedback-banner feedback-wrong" style={{ marginBottom: 12 }}>
-                {formError}
-              </div>
-            )}
-
-            <button id="btn-start" className="btn-primary" onClick={startQuiz}>
-              🚀 Start Assessment
-            </button>
-          </div>
+          <ConversationalWelcome
+            name={name}
+            setName={setName}
+            grade={grade}
+            setGrade={setGrade}
+            onStart={startQuiz}
+            error={formError}
+          />
         )}
 
         {/* ── LOADING ───────────────────────────────────────────────────────── */}
@@ -279,82 +268,128 @@ export default function Home() {
         {phase === 'question' && question && (() => {
           const meta = SECTION_META[question.section]
           return (
-            <div>
+            <div className="chat-container">
               {/* Progress bar */}
-              <div className="progress-meta">
-                <span className="progress-label">Question {questionIndex + 1} of {total}</span>
-                <span className="progress-count">{Math.round(progress)}%</span>
-              </div>
-              <div className="progress-bar-track">
-                <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
-              </div>
-
-              {/* Section badge */}
-              <span className={`section-badge ${meta.badgeClass}`}>
-                {meta.icon} {meta.label}
-              </span>
-
-              {/* Audio Playback for Listening */}
-              {question.section === 'listening' && question.audio_script && (
-                <div className="audio-script-box" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <span>🔊 Listen carefully to the audio script.</span>
-                  <button 
-                    className="btn-primary" 
-                    style={{ width: 'auto', padding: '8px 16px', margin: 0, fontSize: 13 }}
-                    onClick={() => handleSpeak(question.audio_script!)}
-                  >
-                    ▶️ Play Audio
-                  </button>
+              <div>
+                <div className="progress-meta">
+                  <span className="progress-label">Question {questionIndex + 1} of {total}</span>
+                  <span className="progress-count">{Math.round(progress)}%</span>
                 </div>
-              )}
-
-              {/* Question text */}
-              <p className="question-text">{question.question}</p>
-
-              {/* Hint */}
-              {question.hint && <p className="question-hint">💡 {question.hint}</p>}
-
-              {/* ── Input (hidden once answered) ── */}
-              {!localResult && !loading && (
-                <QuestionInput
-                  question={question}
-                  onSubmitText={submitText}
-                  onSubmitList={submitList}
-                  onSubmitSpeech={submitSpeech}
-                />
-              )}
-
-              {/* Loading spinner */}
-              {loading && (
-                <div className="spinner-wrapper" style={{ padding: '16px 0' }}>
-                  <div className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
-                  <p className="spinner-text">Evaluating…</p>
+                <div className="progress-bar-track">
+                  <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
                 </div>
-              )}
+              </div>
 
-              {/* Feedback */}
-              {localResult && (
-                <>
-                  <div
-                    className={`feedback-banner ${localResult.score >= 60 ? 'feedback-correct' : 'feedback-wrong'}`}
-                    style={{ marginTop: 8 }}
-                  >
-                    <strong>
-                      {localResult.score >= 100 ? '🎉 ' : localResult.score >= 60 ? '👍 ' : '❌ '}
-                    </strong>
-                    {localResult.feedback}
-                    <span className="score-pill">{localResult.score}/100</span>
-                    {localResult.spoken && (
-                      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
-                        🗣 Heard: &ldquo;{localResult.spoken}&rdquo;
+              {/* Question Message */}
+              <div className="chat-row chat-row-left">
+                <div className="mascot-sam-mini">
+                  {question.section === 'listening' ? '👦' : 
+                   question.section === 'reading' ? '📖' :
+                   question.section === 'writing' ? '✍️' : '🎤'}
+                </div>
+                <div className="chat-bubble chat-bubble-sam">
+                  <span className={`section-badge ${meta.badgeClass}`} style={{ transform: 'scale(0.8)', transformOrigin: 'left', marginBottom: '8px' }}>
+                    {meta.icon} {meta.label}
+                  </span>
+
+                  {/* Audio Playback for Listening */}
+                  {question.section === 'listening' && question.audio_script && (
+                    <div className="audio-script-box" style={{ marginBottom: '12px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                        <span style={{ fontSize: '13px' }}>🔊 Listen to Sam</span>
+                        <button
+                          className="btn-primary"
+                          style={{ width: 'auto', padding: '6px 12px', margin: 0, fontSize: '11px', boxShadow: '0 3px 0px var(--accent-green-dark)' }}
+                          onClick={() => handleSpeak(`Sam says, ${question.audio_script!}`)}
+                        >
+                          ▶️ PLAY
+                        </button>
                       </div>
-                    )}
+                    </div>
+                  )}
+
+                  <div className="question-text">
+                    <TextType
+                      text={(() => {
+                        if (question.type === 'tap_wrong_word' || question.type === 'sentence_build') {
+                          return question.question.split(':')[0].trim();
+                        }
+                        if (question.type === 'fill_blank') {
+                          // Only show the instruction part
+                          return question.question.split(':')[0].trim();
+                        }
+                        if (question.sentence && question.question && question.sentence !== question.question) {
+                          return `${question.sentence}\n\n${question.question}`;
+                        }
+                        return question.question || question.sentence || "";
+                      })()}
+                      shouldStart={question.section !== 'listening' || isAudioPlaying}
+                      typingSpeed={30}
+                      loop={false}
+                      onSentenceComplete={() => setShowOptions(true)}
+                    />
                   </div>
 
-                  <button id="btn-continue" className="btn-continue" onClick={handleNext}>
-                    {isDone ? '🏁 See Results' : 'Continue →'}
-                  </button>
-                </>
+                  {question.hint && <p className="question-hint" style={{ marginTop: '8px', marginBottom: 0 }}>💡 {question.hint}</p>}
+                </div>
+              </div>
+
+              {/* User Answer Area (Right) */}
+              <div className="chat-row chat-row-right">
+                <div className="chat-options-container" style={{ alignItems: 'flex-end', maxWidth: '100%' }}>
+                  {!localResult && !loading && showOptions && (
+                    <div style={{ width: '100%', display: 'flex', justifyContent: 'flex-end' }}>
+                      <div style={{ maxWidth: '400px', width: '100%' }}>
+                        <QuestionInput
+                          question={question}
+                          onSubmitText={submitText}
+                          onSubmitList={submitList}
+                          onSubmitSpeech={submitSpeech}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {userAnswer && (
+                    <div className="chat-bubble chat-bubble-user" style={{ animation: 'slideRight 0.3s ease both' }}>
+                      <div className="chat-bubble-user-label">My Answer</div>
+                      <div>
+                        {userAnswer}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Sam's Feedback Bubble */}
+              {loading && (
+                <div className="chat-row chat-row-left">
+                  <div className="mascot-sam-mini">👦</div>
+                  <div className="chat-bubble chat-bubble-sam">
+                    <div className="spinner" style={{ width: 24, height: 24, borderWidth: 2 }} />
+                  </div>
+                </div>
+              )}
+
+              {localResult && (
+                <div className="chat-row chat-row-left">
+                  <div className="mascot-sam-mini">👦</div>
+                  <div className="chat-bubble chat-bubble-sam chat-bubble-feedback">
+                    <div
+                      className={`feedback-banner ${localResult.score >= 60 ? 'feedback-correct' : 'feedback-wrong'}`}
+                      style={{ marginTop: 0, marginBottom: 12 }}
+                    >
+                      <strong>
+                        {localResult.score >= 100 ? '🎉 ' : localResult.score >= 60 ? '👍 ' : '❌ '}
+                      </strong>
+                      {localResult.feedback}
+                    </div>
+
+                    <button id="btn-continue" className="btn-continue" onClick={handleNext}>
+                      {isDone ? '🏁 See Results' : 'Continue →'}
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           )
@@ -376,6 +411,110 @@ export default function Home() {
   )
 }
 
+// ─── Conversational Welcome ───────────────────────────────────────────────────
+
+function ConversationalWelcome({
+  name, setName,
+  grade, setGrade,
+  onStart,
+  error
+}: {
+  name: string; setName: (n: string) => void;
+  grade: string; setGrade: (g: string) => void;
+  onStart: (section?: string) => void;
+  error?: string;
+}) {
+  const [step, setStep] = useState(1)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const SECTIONS = [
+    { id: 'listening', label: 'Listening', icon: '🎧' },
+    { id: 'reading', label: 'Reading', icon: '📖' },
+    { id: 'writing', label: 'Writing', icon: '✍️' },
+    { id: 'speaking', label: 'Speaking', icon: '🎤' },
+  ]
+
+  const nextStep = () => {
+    if (step === 1 && !name.trim()) return
+    if (step < 3) setStep(prev => prev + 1)
+  }
+
+  return (
+    <div className="conversational-container">
+      <div className="mascot-wrapper">🦄</div>
+
+      <div className="speech-bubble">
+        {step === 1 ? (
+          <>Hi! I&apos;m Sparky! <br /> What&apos;s your name?</>
+        ) : step === 2 ? (
+          <>Nice to meet you, {name}! <br /> What class are you in?</>
+        ) : (
+          <>Great! What do you want to <br /> practice today?</>
+        )}
+      </div>
+
+      <div className="input-container">
+        {step === 1 ? (
+          <div className="form-group">
+            <input
+              ref={inputRef}
+              className="form-input"
+              type="text"
+              placeholder="Type your name here..."
+              value={name}
+              onChange={e => setName(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && nextStep()}
+              autoFocus
+            />
+          </div>
+        ) : step === 2 ? (
+          <div className="class-grid" style={{ marginBottom: 16 }}>
+            {['1', '2', '3', '4', '5', '6', '7', '8'].map(c => (
+              <button
+                key={c}
+                className={`class-btn ${grade === c ? 'selected' : ''}`}
+                onClick={() => { setGrade(c); nextStep(); }}
+              >
+                Class {c}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="class-grid" style={{ marginBottom: 16, gridTemplateColumns: 'repeat(2, 1fr)' }}>
+            {SECTIONS.map(s => (
+              <button
+                key={s.id}
+                className="class-btn"
+                style={{ height: 'auto', padding: '16px 8px', display: 'flex', flexDirection: 'column', gap: '8px' }}
+                onClick={() => onStart(s.id)}
+              >
+                <span style={{ fontSize: '24px' }}>{s.icon}</span>
+                <span style={{ fontSize: '14px' }}>{s.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <div className="feedback-banner feedback-wrong" style={{ width: '100%', marginBottom: 16 }}>
+          {error}
+        </div>
+      )}
+
+      {step === 1 && (
+        <button
+          className="btn-primary"
+          onClick={nextStep}
+          disabled={!name.trim()}
+        >
+          Next →
+        </button>
+      )}
+    </div>
+  )
+}
+
 // ─── Question Input Router ────────────────────────────────────────────────────
 
 interface InputProps {
@@ -387,14 +526,14 @@ interface InputProps {
 
 function QuestionInput({ question, onSubmitText, onSubmitList, onSubmitSpeech }: InputProps) {
   switch (question.type) {
-    case 'mcq':           return <MCQInput q={question} onSubmit={onSubmitText} />
+    case 'mcq': return <MCQInput q={question} onSubmit={onSubmitText} />
     case 'tap_wrong_word': return <TapWordInput q={question} onSubmit={onSubmitText} />
-    case 'fill_blank':    return <FillBlankInput q={question} onSubmit={onSubmitList} />
+    case 'fill_blank': return <FillBlankInput q={question} onSubmit={onSubmitList} />
     case 'sentence_build': return <SentenceBuildInput q={question} onSubmit={onSubmitText} />
-    case 'rewrite':       return <OpenTextInput q={question} onSubmit={onSubmitText} placeholder="Rewrite the sentence correctly…" />
-    case 'open_text':     return <OpenTextInput q={question} onSubmit={onSubmitText} />
-    case 'speech':        return <SpeechInput q={question} onSubmit={onSubmitSpeech} />
-    default:              return <p style={{ color: 'var(--text-muted)' }}>Unknown question type.</p>
+    case 'rewrite': return <OpenTextInput q={question} onSubmit={onSubmitText} placeholder="Rewrite the sentence correctly…" />
+    case 'open_text': return <OpenTextInput q={question} onSubmit={onSubmitText} />
+    case 'speech': return <SpeechInput q={question} onSubmit={onSubmitSpeech} />
+    default: return <p style={{ color: 'var(--text-muted)' }}>Unknown question type.</p>
   }
 }
 
@@ -463,23 +602,40 @@ function TapWordInput({ q, onSubmit }: { q: Question; onSubmit: (a: string) => P
 
 function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) => Promise<void> }) {
   const blanks = q.blanks ?? 1
-  const [slots, setSlots]   = useState<(string | null)[]>(Array(blanks).fill(null))
-  const [used, setUsed]     = useState<string[]>([])
+  const [slots, setSlots] = useState<(string | null)[]>(Array(blanks).fill(null))
+  const [used, setUsed] = useState<string[]>([])
   const [submitted, setSubmitted] = useState(false)
+
+  // Try to find the sentence part of the question
+  const sentence = q.question.includes('"') ? q.question.split('"')[1] : (q.sentence || q.question);
+  
+  // Split the sentence by underscores to insert our interactive slots
+  // We handle ___ , __ etc.
+  const parts = sentence.split(/_+/)
 
   const selectOpt = (opt: string) => {
     if (submitted) return
     const idx = slots.findIndex(s => s === null)
     if (idx === -1) return
-    const ns = [...slots]; ns[idx] = opt
-    setSlots(ns); setUsed(p => [...p, opt])
+    const ns = [...slots]
+    ns[idx] = opt
+    setSlots(ns)
+    setUsed(p => [...p, opt])
   }
 
   const clearSlot = (idx: number) => {
     if (submitted) return
-    const word = slots[idx]; if (!word) return
-    const ns = [...slots]; ns[idx] = null; setSlots(ns)
-    setUsed(p => { const c = [...p]; c.splice(c.indexOf(word), 1); return c })
+    const word = slots[idx]
+    if (!word) return
+    const ns = [...slots]
+    ns[idx] = null
+    setSlots(ns)
+    setUsed(p => {
+      const c = [...p]
+      const findIdx = c.indexOf(word)
+      if (findIdx > -1) c.splice(findIdx, 1)
+      return c
+    })
   }
 
   const allFilled = slots.every(s => s !== null)
@@ -491,8 +647,28 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
   }
 
   return (
-    <div>
-      <div className="fill-options">
+    <div className="fill-interactive-container">
+      {/* The Sentence with Blanks */}
+      <div className="fill-sentence-area" style={{ marginBottom: 24, fontSize: '18px', fontWeight: 600, lineHeight: 1.8 }}>
+        {parts.map((p, i) => (
+          <span key={i}>
+            {p}
+            {i < parts.length - 1 && (
+              <span 
+                className={`blank-slot-inline ${slots[i] ? 'filled' : 'empty'}`}
+                onClick={() => slots[i] && clearSlot(i)}
+                style={{ cursor: slots[i] ? 'pointer' : 'default' }}
+                id={`slot-${q.id}-${i}`}
+              >
+                {slots[i] ?? '____'}
+              </span>
+            )}
+          </span>
+        ))}
+      </div>
+
+      {/* The Options */}
+      <div className="fill-options" style={{ justifyContent: 'center', marginBottom: 24 }}>
         {q.options?.map((opt, i) => (
           <button
             key={`${opt}-${i}`}
@@ -505,26 +681,15 @@ function FillBlankInput({ q, onSubmit }: { q: Question; onSubmit: (a: string[]) 
           </button>
         ))}
       </div>
-      <div className="blank-slots" style={{ marginBottom: 16 }}>
-        {slots.map((val, i) => (
-          <button
-            key={i}
-            id={`slot-${q.id}-${i}`}
-            className={`blank-slot${val === null ? ' empty' : ''}`}
-            onClick={() => clearSlot(i)}
-            disabled={submitted}
-          >
-            {val ?? `Blank ${i + 1}`}
-          </button>
-        ))}
-      </div>
+
       <button
         id={`fb-submit-${q.id}`}
         className="btn-primary"
         onClick={doSubmit}
         disabled={!allFilled || submitted}
+        style={{ width: '100%' }}
       >
-        Submit
+        SUBMIT
       </button>
     </div>
   )
@@ -563,16 +728,16 @@ function SentenceBuildInput({ q, onSubmit }: { q: Question; onSubmit: (a: string
         {assembled.length === 0
           ? <span className="sentence-area-placeholder">Tap words below to build the sentence…</span>
           : assembled.map(item => (
-              <button
-                key={item.id}
-                id={`asm-${item.id}`}
-                className="word-chip selected"
-                onClick={() => removeWord(item)}
-                disabled={submitted}
-              >
-                {item.word}
-              </button>
-            ))
+            <button
+              key={item.id}
+              id={`asm-${item.id}`}
+              className="word-chip selected"
+              onClick={() => removeWord(item)}
+              disabled={submitted}
+            >
+              {item.word}
+            </button>
+          ))
         }
       </div>
       <div className="word-chips" style={{ marginBottom: 16 }}>
@@ -605,7 +770,7 @@ function SentenceBuildInput({ q, onSubmit }: { q: Question; onSubmit: (a: string
 function OpenTextInput({
   q, onSubmit, placeholder,
 }: { q: Question; onSubmit: (a: string) => Promise<void>; placeholder?: string }) {
-  const [text, setText]       = useState('')
+  const [text, setText] = useState('')
   const [submitted, setSubmitted] = useState(false)
 
   const doSubmit = () => {
@@ -641,11 +806,11 @@ function OpenTextInput({
 
 function SpeechInput({ q, onSubmit }: { q: Question; onSubmit: (b: Blob) => Promise<void> }) {
   const [recording, setRecording] = useState(false)
-  const [audioUrl, setAudioUrl]   = useState<string | null>(null)
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
   const [submitted, setSubmitted] = useState(false)
-  const [error, setError]         = useState<string | null>(null)
-  const mediaRef  = useRef<MediaRecorder | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const mediaRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
 
   const startRecording = async () => {
@@ -727,18 +892,18 @@ function avg(arr: number[]) {
 }
 
 function gradeLabel(score: number) {
-  if (score >= 90) return 'Outstanding! 🌟'
-  if (score >= 75) return 'Great job! 🎉'
-  if (score >= 60) return 'Good effort! 👍'
-  if (score >= 40) return 'Keep practising! 💪'
-  return "Don't give up! 🌱"
+  if (score >= 90) return 'Superstar! 🌟 You are amazing!'
+  if (score >= 75) return 'Great Job! 🎈 Keep it up!'
+  if (score >= 60) return 'Well Done! 👍 You passed!'
+  if (score >= 40) return 'Nice Effort! 💪 Practice makes perfect!'
+  return "Keep Trying! 🌱 You can do it!"
 }
 
 const SECTION_LIST = [
   { key: 'listening' as const, label: 'Listening', icon: '🎧', cls: 's-listening' },
-  { key: 'reading'   as const, label: 'Reading',   icon: '📖', cls: 's-reading'   },
-  { key: 'writing'   as const, label: 'Writing',   icon: '✍️',  cls: 's-writing'  },
-  { key: 'speaking'  as const, label: 'Speaking',  icon: '🎤', cls: 's-speaking'  },
+  { key: 'reading' as const, label: 'Reading', icon: '📖', cls: 's-reading' },
+  { key: 'writing' as const, label: 'Writing', icon: '✍️', cls: 's-writing' },
+  { key: 'speaking' as const, label: 'Speaking', icon: '🎤', cls: 's-speaking' },
 ]
 
 function ScoreRing({ score }: { score: number }) {
@@ -746,9 +911,9 @@ function ScoreRing({ score }: { score: number }) {
   const circ = 2 * Math.PI * r
   const dash = (score / 100) * circ
   const color =
-    score >= 80 ? 'var(--accent-teal)' :
-    score >= 50 ? 'var(--accent-purple)' :
-    '#e05463'
+    score >= 80 ? 'var(--accent-green)' :
+      score >= 50 ? 'var(--accent-yellow)' :
+        'var(--accent-red)'
 
   return (
     <div className="score-ring-wrapper">
@@ -784,11 +949,11 @@ function ResultsScreen({ name, grade, finalScore, sectionScores, onRestart }: Re
   return (
     <div>
       <div className="results-hero">
-        <div className="stars">⭐⭐⭐</div>
+        <div className="stars">✨✨✨</div>
         <ScoreRing score={rounded} />
         <p className="results-name">{name}</p>
-        <p className="results-class">Class {grade} · Mystery Island Assessment</p>
-        <p style={{ marginTop: 12, fontSize: 16, fontWeight: 600, color: 'var(--text-secondary)' }}>
+        <p className="results-class">Class {grade} · Sparky Quest Adventure</p>
+        <p style={{ marginTop: 12, fontSize: 18, fontWeight: 700, color: 'var(--accent-green)' }}>
           {gradeLabel(rounded)}
         </p>
       </div>
@@ -813,8 +978,8 @@ function ResultsScreen({ name, grade, finalScore, sectionScores, onRestart }: Re
 
       <div className="divider" />
 
-      <button id="btn-restart" className="btn-restart" onClick={onRestart}>
-        🔄 Try Again
+      <button id="btn-restart" className="btn-primary" onClick={onRestart}>
+        🔄 Play Again!
       </button>
     </div>
   )
